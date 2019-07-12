@@ -1,190 +1,222 @@
-// This pipeline automatically tests a student's full homework
-// environment for OpenShift Advanced Application Development Homework
-// and then executes the pipelines to ensure that everything works.
-//
-// Successful completion of this pipeline means that the
-// student passed the homework assignment.
-// Failure of the pipeline means that the student failed
-// the homework assignment.
+#!groovy
+def GUID="225e"
+def devProject = "${GUID}-tasks-dev"
+def prodProject = "${GUID}-tasks-prod"
+def JOB_BASE_NAME = "AmarChourasiyaTCS"
 
-// How to setup:
-// -------------
-// * Create a persistent Jenkins in a separate project (e.g. gpte-jenkins)
-//
-// * Add self-provisioner role to the service account jenkins
-//   oc adm policy add-cluster-role-to-user self-provisioner system:serviceaccount:gpte-jenkins:jenkins 
-//
-// * Create an Item of type Pipeline (Use name "HomeworkGrading")
-// * Create Five Parameters:
-//   - GUID (type String):    GUID to prefix all projects
-//   - USER (type String):    OpenTLC User ID to receive admin permissions on created projects
-//   - REPO (type String):    full URL to the public Homework Repo
-//                            (either Gogs or Github)
-//   - CLUSTER (type String): Cluster base URL. E.g. na39.openshift.opentlc.com
-//   - SETUP (type Boolean):  Default: true
-//                            If true will create all necessary projects.
-//                            If false assumes that projects are already there and only pipelines need
-//                            to be executed.
-//   - DELETE (type Boolean): Default: true
-//                            If true will delete all created projects
-//                            after a successful run.
-// * Use https://github.com/redhat-gpte-devopsautomation/advdev_homework_grading as the Git Repo
-//   and 'Jenkinsfile' as the Jenkinsfile.
+podTemplate(
+  label: "skopeo-pod",
+  cloud: "openshift",
+  inheritFrom: "maven",
+  containers: [
+    containerTemplate(
+      name: "jnlp",
+      image: "docker-registry.default.svc:5000/${GUID}-jenkins/jenkins-agent-appdev",
+      resourceRequestMemory: "1Gi",
+      resourceLimitMemory: "2Gi",
+      resourceRequestCpu: "1",
+      resourceLimitCpu: "2"
+    )
+  ]
+) {
+  node('skopeo-pod') {
+    // Define Maven Command to point to the correct
+    // settings for our Nexus installation
+    echo "########################################## Starting  + MVN CMD #############################################"
+    def mvnCmd = "mvn -s ../nexus_settings.xml"
 
-pipeline {
-  agent {
-    kubernetes {
-      label "homework"
-      cloud "openshift"
-      inheritFrom "maven"
-      containerTemplate {
-        name "jnlp"
-        image "docker-registry.default.svc:5000/gpte-jenkins/jenkins-agent-appdev:latest"
-        resourceRequestMemory "1Gi"
-        resourceLimitMemory "2Gi"
-        resourceRequestCpu "1"
-        resourceLimitCpu "2"
-      }
+    // Checkout Source Code.
+    stage('Checkout Source') {
+      echo "########################################## checking out source #############################################"
+      checkout scm
+      echo "################################################## Done! ###################################################"
     }
-  }
-  stages {
-    stage('Get Student Homework Repo') {
-      steps {
-        echo "*******************************************************\n" +
-             "*** Advanced OpenShift Development Homework Grading ***\n" +
-             "*** GUID:         ${GUID}\n" +
-             "*** USER:         ${USER}\n" +
-             "*** Student Repo: *********\n" +
-             "*** CLUSTER:      ${CLUSTER}\n" +
-             "*** SETUP:        ${SETUP}\n" +
-             "*** DELETE:       ${DELETE}\n" +
-             "*******************************************************"
 
-        echo "Cloning Student Project Repository"
-        git '${REPO}'
-      }
-    }
-    stage("Create Projects") {
-      when {
-        environment name: 'SETUP', value: 'true'
-      }
-      steps {
-        echo "Creating Projects"
-        sh "./bin/setup_projects.sh ${GUID} ${USER} true"
-      }
-    }
-    stage("Setup Infrastructure") {
-      failFast true
-      when {
-        environment name: 'SETUP', value: 'true'
-      }
-      parallel {
-        stage("Setup Jenkins") {
-          steps {
-            echo "Setting up Jenkins"
-            sh "./bin/setup_jenkins.sh ${GUID} ${REPO} ${CLUSTER}"
-          }
+    // Build the Tasks Service
+    dir('openshift-tasks') {
+      echo "########################################## Define vars #############################################"
+      // The following variables need to be defined at the top level
+      // and not inside the scope of a stage - otherwise they would not
+      // be accessible from other stages.
+      // Extract version from the pom.xml
+      def version = getVersionFromPom("pom.xml")
+      // Set the tag for the development image: version + build number
+      def devTag  = "${version}-" + currentBuild.number
+      // Set the tag for the production image: version
+      def prodTag = "${version}"
+      echo "########################################## Version: ${version} #############################################"
+      echo "########################################## DevTag:  ${devTag} ##############################################"
+      echo "########################################## ProdTag: ${prodTag} #############################################"
+      // Using Maven build the war file
+      // Do not run tests in this step
+      stage('Build war') {
+        echo "######################################## Building version ${devTag}"
+        echo "########################################       Building.. ###############################################"
+        // maven command defined at start of pipeline skript
+        // used to execute by sh here with param.
+        sh "${mvnCmd} clean package -DskipTests=true"
+        echo "########################################       Done..! ##################################################"
         }
-        stage("Setup Development Project") {
-          steps {
-            echo "Setting up Development Project"
-            sh "./bin/setup_dev.sh ${GUID}"
+
+
+      // The next two stages should run in parallel
+
+      // Using Maven run the unit tests
+      stage('Unit Tests & Code Analysis in paralles') {
+        parallel (
+          "Run unit tests": {
+              echo "############################################ Runnin g Unit Tests ###########################################"
+              sh "${mvnCmd} test"
+              echo "##################################################### Done ###########################################"
+          },
+          "Run code coverage tests": {
+              echo "###############################################Running Code Analysis##################################"
+              sh "${mvnCmd} sonar:sonar -Dsonar.host.url=http://sonarqube-gpte-hw-cicd.apps.na311.openshift.opentlc.com/ -Dsonar.projectName=${JOB_BASE_NAME} -Dsonar.projectVersion=${devTag}"
+              echo "##################################################### Done ###########################################" 
           }
-        }
-        stage("Setup Production Project") {
-          steps {
-            echo "Setting up Production Project"
-            sh "./bin/setup_prod.sh ${GUID}"
-          }
-        }
+        )
       }
-    }
-    stage("Reset Projects") {
-      failFast true
-      when {
-        environment name: 'SETUP', value: 'false'
+
+      // Publish the built war file to Nexus
+      stage('Publish to Nexus') {
+        echo "#################################################### Publish to Nexus #############################################"
+        sh "${mvnCmd} deploy -DskipTests=true \
+          -DaltDeploymentRepository=nexus::default::http://nexus3.gpte-hw-cicd.svc.cluster.local:8081/repository/releases"
+        echo "######################################################   Done..! ##################################################"    
       }
-      steps {
-        sh "./bin/reset_prod.sh ${GUID}"
-      }
-    }
-    stage("First Pipeline Run (from Green to Blue)") {
-      steps {
-        echo "Executing Initial Tasks Pipeline - BLUE deployment"
+
+      // Build the OpenShift Image in OpenShift and tag it.
+      stage('Build and Tag OpenShift Image') {
+        echo "###########################################Building OpenShift container image tasks:${devTag}  ###################"
+        //Start binary build in OpenShift using the file we just published.
         script {
-          openshift.withCluster() {
-            openshift.withProject("${GUID}-jenkins") {
-              openshift.selector("bc", "tasks-pipeline").startBuild("--wait=true")
+         openshift.withCluster() {
+          openshift.withProject("${devProject}") {
+           openshift.selector("bc", "tasks").startBuild("--from-file=./target/openshift-tasks.war", "--wait=true")
+           echo "######################################################   Done..! ##################################################"
+
+           // Tag the image using the devTag.
+           echo "########################################## Tag the image with : ${devTag} #########################################" 
+           openshift.tag("tasks:latest", "tasks:${devTag}")
+           echo "######################################################   Done..! ##################################################"  
+          }
+         } 
+        }
+      }
+
+      // Deploy the built image to the Development Environment.
+      stage('Deploy to Dev') {
+        echo "####################################### Deploying container image to Development Project ##############################"
+          script {
+          // Update the Image on the Development Deployment Config
+            openshift.withCluster() {
+              openshift.withProject("${devProject}") {
+                openshift.set("image", "dc/tasks", "tasks=docker-registry.default.svc:5000/${devProject}/tasks:${devTag}")
+
+          // Update the Config Map which contains the users for the Tasks application
+          // (just in case the properties files changed in the latest commit)
+            openshift.selector('configmap', 'tasks-config').delete()
+            def configmap = openshift.create('configmap', 'tasks-config', '--from-file=./configuration/application-users.properties', '--from-file=./configuration/application-roles.properties' )
+
+          // Deploy the development application.
+            openshift.selector("dc", "tasks").rollout().latest();
+
+          // Wait for application to be deployed
+            def dc = openshift.selector("dc", "tasks").object()
+            def dc_version = dc.status.latestVersion
+            def rc = openshift.selector("rc", "tasks-${dc_version}").object()
+
+            echo "Waiting for ReplicationController tasks-${dc_version} to be ready"
+            while (rc.spec.replicas != rc.status.readyReplicas) {
+              sleep 5
+            rc = openshift.selector("rc", "tasks-${dc_version}").object()
+              }
             }
           }
         }
       }
-    }
-    stage('Test Tasks in Dev') {
-      steps {
-        echo "Testing Tasks Dev Application"
+
+      // Copy Image to Nexus container registry
+      stage('Copy Image to Nexus container registry') {
+        echo "############################################ Copy image to Nexus container registry #####################################"
         script {
-          def devTasksRoute = sh(returnStdout: true, script: "curl tasks-${GUID}-tasks-dev.apps.${CLUSTER}").trim()
-          // Check if the returned string contains "tasks-dev"
-          if (devTasksRoute.contains("tasks-dev")) {
-            echo "*** tasks-dev validated successfully."
-          }
-          else {
-            error("*** tasks-dev returned unexpected name.")
+          sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:\$(oc whoami -t) --dest-creds admin:redhat docker://docker-registry.default.svc.cluster.local:5000/${devProject}/tasks:${devTag} docker://nexus-registry.gpte-hw-cicd.svc.cluster.local:5000/tasks:${devTag}"
+
+        // Tag the built image with the production tag.
+        openshift.withCluster() {
+         openshift.withProject("${prodProject}") {
+          openshift.tag("${devProject}/tasks:${devTag}", "${devProject}/tasks:${prodTag}")
+            }      
           }
         }
       }
-    }
-    stage('Test Blue Services in Prod') {
-      steps {
-        echo "Testing Prod Services (BLUE)"
+// ########################################################################################
+      // Blue/Green Deployment into Production
+      // -------------------------------------
+      def destApp   = "tasks-green"
+      def activeApp = ""
+      echo "############################################ Blue/Green Deployment into Production ##############################"
+      
+      stage('Blue/Green Production Deployment') {
         script {
-          def tasksRoute = sh(returnStdout: true, script: "curl tasks-${GUID}-tasks-prod.apps.${CLUSTER}").trim()
-          // Check if the returned string contains "tasks-blue"
-          if (tasksRoute.contains("tasks-blue")) {
-            echo "*** tasks-blue validated successfully."
+        // Determine which application is active
+        openshift.withCluster() {
+         openshift.withProject("${prodProject}") {
+          activeApp = openshift.selector("route", "tasks").object().spec.to.name
+          if (activeApp == "tasks-green") {
+            destApp = "tasks-blue"
           }
-          else {
-            error("*** tasks-blue returned unexpected name.")
+          echo "######################################### Active Application:      " + activeApp
+          echo "######################################### Destination Application: " + destApp
+        
+        // Set Image, Set VERSION
+                // Update the Image on the Production Deployment Config
+                def dc = openshift.selector("dc/${destApp}").object()
+                dc.spec.template.spec.containers[0].image="docker-registry.default.svc:5000/${devProject}/tasks:${prodTag}"
+                openshift.apply(dc)
+
+                // Update Config Map in change config files changed in the source
+                openshift.selector("configmap", "${destApp}-config").delete()
+                def configmap = openshift.create("configmap", "${destApp}-config", "--from-file=./configuration/application-users.properties", "--from-file=./configuration/application-roles.properties" )
+   
+           
+        // Deploy into the other application
+        openshift.selector("dc", "${destApp}").rollout().latest();
+           
+        // Make sure the application is running and ready before proceeding
+          def dc_prod = openshift.selector("dc", "${destApp}").object()
+          def dc_version = dc_prod.status.latestVersion
+          def rc_prod = openshift.selector("rc", "${destApp}-${dc_version}").object()
+          echo "########################################### Waiting for ${destApp} to be ready ######################################"
+          while (rc_prod.spec.replicas != rc_prod.status.readyReplicas) {
+            sleep 5
+            rc_prod = openshift.selector("rc", "${destApp}-${dc_version}").object()
+              }
+            }
           }
-        }
+        }   
       }
-    }
-    stage("Second Pipeline Run (from Blue to Green)") {
-      steps {
-        echo "Executing Second Tasks Pipeline - GREEN deployment"
+    
+      stage('Switch over to new Version') {
+        echo "######################################## Switching Production application to ${destApp}. ###############################"
+        // removed: input "Switch Production?"       
         script {
           openshift.withCluster() {
-            openshift.withProject("${GUID}-jenkins") {
-              openshift.selector("bc", "tasks-pipeline").startBuild("--wait=true")
+            openshift.withProject("${prodProject}") {
+              def route = openshift.selector("route/tasks").object()
+                route.spec.to.name="${destApp}"
+                  openshift.apply(route)
             }
           }
         }
       }
-    }
-    stage('Test Green Parksmap in Prod') {
-      steps {
-        echo "Testing Prod Parksmap Application (GREEN)"
-        script {
-          def tasksRoute = sh(returnStdout: true, script: "curl tasks-${GUID}-tasks-prod.apps.${CLUSTER}").trim()
-          // Check if the returned string contains "tasks-green"
-          if (tasksRoute.contains("tasks-green")) {
-            echo "*** tasks-green validated successfully."
-          }
-          else {
-            error("*** tasks-green returned unexpected name.")
-          }
-        }
-      }
-    }
-    stage('Cleanup') {
-      when {
-        environment name: 'DELETE', value: 'true'
-      }
-      steps {
-        echo "Cleanup - deleting all projects for GUID=${GUID}"
-        sh "./bin/cleanup.sh ${GUID}"
-      }
-    }
-  }
+    } 
+}
+}
+// Convenience Functions to read version from the pom.xml
+// Do not change anything below this line.
+// --------------------------------------------------------
+def getVersionFromPom(pom) {
+  def matcher = readFile(pom) =~ '<version>(.+)</version>'
+  matcher ? matcher[0][1] : null
 }
