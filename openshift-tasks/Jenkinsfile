@@ -1,8 +1,8 @@
 #!groovy
-def GUID="acb9"
+def GUID="15d1"
 def devProject = "${GUID}-tasks-dev"
 def prodProject = "${GUID}-tasks-prod"
-def JOB_BASE_NAME = "SanthoshNTCS"
+def JOB_BASE_NAME = "NimmaniSanthoshTCS"
 
 podTemplate(
   label: "skopeo-pod",
